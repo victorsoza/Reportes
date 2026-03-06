@@ -17,13 +17,15 @@ from PyQt6.QtGui import QFont
 import pandas as pd
 import pyodbc
 
-from tabs.inventory_tab import InventoryTabMixin
-from tabs.sales_tab import SalesTabMixin
-from tabs.movements_tab import MovementsTabMixin
-from tabs.analisis_inventario_tab import AnalisisInventarioTab
+from tabs.Actualizar_Datos.inventory_tab import InventoryTabMixin
+from tabs.Actualizar_Datos.sales_tab import SalesTabMixin
+from tabs.Actualizar_Datos.movements_tab import MovementsTabMixin
+from tabs.Actualizar_Datos.importaciones_tab import ImportacionesTabMixin
+from tabs.Actualizar_Datos.compras_local_tab import ComprasLocalTabMixin
+from tabs.Analisis_Inventario.analisis_inventario_tab import AnalisisInventarioTab
 from tabs.devoluciones_especiales_tab import DevolucionesEspecialesTab
-from tabs.reportes_tab import ReportesTab
-from tabs.marketshare_tab import MarketshareTab
+from tabs.reportes.reportes_tab import ReportesTab
+from tabs.marketshare.marketshare_tab import MarketshareTab
 from db_config import build_connection_string, DB_CONNECTIONS, connect_db
 
 LOG_FILE = os.path.join(os.path.dirname(__file__), "app.log")
@@ -35,15 +37,30 @@ def get_logger():
     if logger.handlers:
         return logger
     logger.setLevel(logging.DEBUG)
-    handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.debug("Logger initialized; writing to %s", LOG_FILE)
+    # Intentar crear el directorio del log y usar FileHandler; si falla, usar StreamHandler
+    try:
+        log_dir = os.path.dirname(LOG_FILE)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.debug("Logger initialized; writing to %s", LOG_FILE)
+    except Exception:
+        stream = logging.StreamHandler()
+        formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        stream.setFormatter(formatter)
+        logger.addHandler(stream)
+        logger.debug("Logger initialized with StreamHandler (FileHandler failed)")
     return logger
 
 
-class ReportesApp(InventoryTabMixin, SalesTabMixin, MovementsTabMixin, QMainWindow):
+class ReportesApp(InventoryTabMixin, SalesTabMixin, MovementsTabMixin, ImportacionesTabMixin, ComprasLocalTabMixin, QMainWindow):
     def __init__(self):
         super().__init__()
         self.logger = get_logger()
@@ -102,6 +119,15 @@ class ReportesApp(InventoryTabMixin, SalesTabMixin, MovementsTabMixin, QMainWind
         self.setup_sales_tab()
         self.setup_inventory_import_tab()
         self.setup_movements_tab()  # Ahora la pestaña de movimientos se agrega como subpestaña de Actualizacion de datos
+        # Nuevas subpestañas solicitadas
+        try:
+            self.setup_importaciones_tab()
+        except Exception:
+            pass
+        try:
+            self.setup_compras_local_tab()
+        except Exception:
+            pass
 
         # Volver a la pestaña principal y mostrar 'Actualizacion de datos' como predeterminada
         self.tab_widget = main_tab_widget
@@ -271,6 +297,19 @@ class ReportesApp(InventoryTabMixin, SalesTabMixin, MovementsTabMixin, QMainWind
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # Establecer icono de la aplicación usando ruta compatible con bundle PyInstaller
+    try:
+        from PyQt6.QtGui import QIcon
+        if getattr(sys, 'frozen', False):
+            base_path = getattr(sys, '_MEIPASS', os.path.dirname(__file__))
+        else:
+            base_path = os.path.dirname(__file__)
+        icon_path = os.path.join(base_path, 'Iconos', 'ComprasInternacionales.ico')
+        if os.path.exists(icon_path):
+            app.setWindowIcon(QIcon(icon_path))
+    except Exception:
+        pass
+
     window = ReportesApp()
     window.show()
     sys.exit(app.exec())

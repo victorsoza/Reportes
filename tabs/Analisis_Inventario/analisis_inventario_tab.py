@@ -3,19 +3,21 @@ import os
 # importaciones necesarias
 import pandas as pd
 import pyodbc
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView, QLabel, QComboBox, QProgressBar
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QMessageBox, QHeaderView, QLabel, QComboBox, QProgressBar, QApplication
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QMovie
+try:
+	from ..shared.loading_dialog import get_loading_dialog
+except Exception:
+	try:
+		from tabs.shared.loading_dialog import get_loading_dialog
+	except Exception:
+		get_loading_dialog = None
 
 class AnalisisInventarioTab(QWidget):
 	def get_logger(self):
-		log_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "app.log")
-		logger = logging.getLogger("AnalisisInventarioTab")
-		if not logger.handlers:
-			handler = logging.FileHandler(log_path, encoding="utf-8")
-			formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-			handler.setFormatter(formatter)
-			logger.addHandler(handler)
+		# Usar el logger central de la aplicación para evitar salida por consola
+		logger = logging.getLogger("ReportesApp")
 		logger.setLevel(logging.INFO)
 		return logger
 	def __init__(self, parent=None):
@@ -37,18 +39,14 @@ class AnalisisInventarioTab(QWidget):
 
 		self.vlayout.addLayout(self.filter_layout)
 
-		# Icono de carga flotante
-		self.loading_overlay = QLabel(self)
-		self.loading_overlay.setVisible(False)
-		self.loading_overlay.setStyleSheet("background: transparent;")
-		self.loading_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-		self.loading_overlay.setFixedSize(120, 120)
-		self.loading_overlay.move(
-			(self.width() - self.loading_overlay.width()) // 2,
-			(self.height() - self.loading_overlay.height()) // 2
-		)
-		self.loading_movie = QMovie(os.path.join(os.path.dirname(__file__), "loading.gif"))
-		self.loading_overlay.setMovie(self.loading_movie)
+		# Dialogo de carga reutilizable
+		try:
+			if get_loading_dialog is not None:
+				self.loading = get_loading_dialog(self)
+			else:
+				self.loading = None
+		except Exception:
+			self.loading = None
 
 		self.table = QTableWidget()
 		self.vlayout.addWidget(self.table)
@@ -117,22 +115,25 @@ class AnalisisInventarioTab(QWidget):
 				self.hide_loading_overlay()
 		return super().eventFilter(obj, event)
 	def show_loading_overlay(self):
-		# Centrar el overlay en el widget principal
-		parent_rect = self.rect()
-		self.loading_overlay.resize(120, 120)
-		self.loading_overlay.move(
-			(parent_rect.width() - self.loading_overlay.width()) // 2,
-			(parent_rect.height() - self.loading_overlay.height()) // 2
-		)
-		self.loading_overlay.raise_()
-		self.loading_overlay.setVisible(True)
-		self.loading_movie.start()
-		from PyQt6.QtWidgets import QApplication
-		QApplication.processEvents()
+		try:
+			if getattr(self, 'loading', None) is not None:
+				self.loading.show()
+				return
+		except Exception:
+			self.logger.debug("show_loading_overlay: get_loading_dialog failed")
+		# Fallback: procesar eventos para dar oportunidad a la UI
+		try:
+			QApplication.processEvents()
+		except Exception:
+			pass
 
 	def hide_loading_overlay(self):
-		self.loading_movie.stop()
-		self.loading_overlay.setVisible(False)
+		try:
+			if getattr(self, 'loading', None) is not None:
+				self.loading.hide()
+				return
+		except Exception:
+			self.logger.debug("hide_loading_overlay: get_loading_dialog failed")
 
 	def on_data_loaded(self, df):
 		self.df = df

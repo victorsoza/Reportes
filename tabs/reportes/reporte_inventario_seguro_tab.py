@@ -27,11 +27,12 @@ if TYPE_CHECKING:
 	from .reporte_inventario_seguro_resumen_tab import ReporteInventarioSeguroResumenTab  # type: ignore
 else:
 	try:
+		# Correct relative import: same package `tabs.reportes`
 		from .reporte_inventario_seguro_resumen_tab import ReporteInventarioSeguroResumenTab
 	except Exception:
 		# Fallback for environments where package relative imports are resolved differently
 		try:
-			from tabs.reporte_inventario_seguro_resumen_tab import ReporteInventarioSeguroResumenTab
+			from tabs.reportes.reporte_inventario_seguro_resumen_tab import ReporteInventarioSeguroResumenTab
 		except Exception:
 			# If import fails at runtime, define a minimal placeholder to avoid NameError.
 			class ReporteInventarioSeguroResumenTab:
@@ -41,14 +42,17 @@ else:
 import pyodbc
 from db_config import connect_db
 import logging
+try:
+	from ..shared.loading_dialog import get_loading_dialog
+except Exception:
+	try:
+		from tabs.shared.loading_dialog import get_loading_dialog
+	except Exception:
+		get_loading_dialog = None
 
-# Logger configured to write to app.log (only adds handler if none present)
-logger = logging.getLogger("app")
-if not logger.handlers:
-	fh = logging.FileHandler("app.log", encoding="utf-8")
-	fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-	logger.addHandler(fh)
-	logger.setLevel(logging.INFO)
+# Usar el logger central de la aplicación (no añadir handlers de consola)
+logger = logging.getLogger("ReportesApp")
+logger.setLevel(logging.INFO)
 
 
 class ReporteInventarioSeguroTab(QWidget):
@@ -182,18 +186,14 @@ class ReporteInventarioSeguroTab(QWidget):
 		self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
 		detalle_layout.addWidget(self.table)
 
-		# Loading GIF overlay
-		loading_gif_path = os.path.join(os.path.dirname(__file__), "loading.gif")
-		self.loading_label = QLabel(self)
-		self.loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-		self.loading_label.setStyleSheet(
-			"background: rgba(255,255,255,0.7); border-radius: 12px; padding: 8px;"
-		)
-		self.loading_label.setVisible(False)
-		self.loading_movie = QMovie(loading_gif_path)
-		self.loading_movie.setScaledSize(QtCore.QSize(150, 150))
-		self.loading_label.setFixedSize(150, 150)
-		self.loading_label.setMovie(self.loading_movie)
+		# Dialogo de carga reutilizable
+		try:
+			if get_loading_dialog is not None:
+				self.loading = get_loading_dialog(self)
+			else:
+				self.loading = None
+		except Exception:
+			self.loading = None
 
 		# Add the two tabs: Detalle (existing UI) and Resumen (modularized)
 		self._tabs.addTab(detalle, "Detalle")
@@ -1150,25 +1150,29 @@ class ReporteInventarioSeguroTab(QWidget):
 		QMessageBox.critical(self, "Error", f"Error al cargar datos: {error_message}")
 
 	def _show_loading_overlay(self):
-		parent = self
-		label = self.loading_label
-		label.resize(180, 180)
-		parent_rect = parent.rect()
-		label.move(
-			(parent_rect.width() - label.width()) // 2,
-			(parent_rect.height() - label.height()) // 2,
-		)
-		label.raise_()
-		label.setVisible(True)
-		self.loading_movie.start()
-		QApplication.processEvents()
+		try:
+			if getattr(self, 'loading', None) is not None:
+				self.loading.show()
+				return
+		except Exception:
+			logger.debug("_show_loading_overlay: get_loading_dialog failed")
+		try:
+			QApplication.processEvents()
+		except Exception:
+			pass
 
 	def _hide_loading_overlay(self):
 		try:
-			self.loading_movie.stop()
+			if getattr(self, 'loading', None) is not None:
+				self.loading.hide()
+				return
+		except Exception:
+			logger.debug("_hide_loading_overlay: get_loading_dialog failed")
+		try:
+			# fallback: nothing to hide
+			pass
 		except Exception:
 			pass
-		self.loading_label.setVisible(False)
 
 	def closeEvent(self, event):
 		# Attempt to stop any active threads gracefully before the widget is destroyed.

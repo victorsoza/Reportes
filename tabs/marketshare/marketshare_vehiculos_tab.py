@@ -1,4 +1,4 @@
-from typing import cast, Iterable, Any
+from typing import cast, Iterable, Any, Callable
 import logging
 from typing import Optional
 from collections import Counter
@@ -10,12 +10,29 @@ import re
 from db_config import connect_db
 
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QTableWidget, QHeaderView, QTableWidgetItem, QPushButton, QHBoxLayout, QFileDialog, QMessageBox, QMenu, QInputDialog, QLineEdit, QListWidget, QListWidgetItem, QWidgetAction, QDialog
-from PyQt6.QtGui import QFont, QIcon, QAction, QColor, QBrush, QMovie
+from PyQt6.QtGui import QFont, QIcon, QAction, QColor, QBrush
 from PyQt6.QtCore import QSize, QEvent
 from PyQt6 import QtCore
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication
 import os
+try:
+    from ..shared.loading_dialog import LoadingDialog
+except Exception:
+    try:
+        from tabs.shared.loading_dialog import LoadingDialog
+    except Exception:
+        LoadingDialog = None
+
+
+# Importar la lógica modulada para el botón 'Guardar Detalles'
+try:
+    from .Logica_Vehiculos import save_details as lv_save_details
+except Exception:
+    try:
+        from tabs.marketshare.Logica_Vehiculos import save_details as lv_save_details
+    except Exception:
+        lv_save_details = None
 
 
 class MarketshareVehiculosTab(QWidget):
@@ -31,19 +48,27 @@ class MarketshareVehiculosTab(QWidget):
         # Botones para acciones: cargar múltiples archivos y limpiar tabla
         btn_layout = QHBoxLayout()
         self.load_files_button = QPushButton("Cargar Excel(s)")
-        self.load_files_button.clicked.connect(lambda: self.load_excel_files())
+        self.load_files_button.clicked.connect(self.load_excel_files)
         btn_layout.addWidget(self.load_files_button)
 
         self.detect_models_button = QPushButton("Detectar Modelos")
-        self.detect_models_button.clicked.connect(lambda: self.identify_models())
+        self.detect_models_button.clicked.connect(self._wrap_with_loading(self.identify_models, "Detectando modelos..."))
         btn_layout.addWidget(self.detect_models_button)
 
         self.save_models_button = QPushButton("Guardar Modelos")
-        self.save_models_button.clicked.connect(lambda: self.save_models_to_db())
+        self.save_models_button.clicked.connect(self._wrap_with_loading(self.save_models_to_db, "Guardando modelos..."))
         btn_layout.addWidget(self.save_models_button)
 
+        self.save_details_button = QPushButton("Guardar Detalles")
+        self.save_details_button.clicked.connect(self._wrap_with_loading(self.save_details, "Guardando detalles..."))
+        btn_layout.addWidget(self.save_details_button)
+
+        self.save_sql_button = QPushButton("Guardar en SQL")
+        self.save_sql_button.clicked.connect(self._wrap_with_loading(self.save_table_to_sql, "Guardando en SQL..."))
+        btn_layout.addWidget(self.save_sql_button)
+
         self.clear_button = QPushButton("Limpiar tabla")
-        self.clear_button.clicked.connect(lambda: self.clear_table())
+        self.clear_button.clicked.connect(self._wrap_with_loading(self.clear_table, "Limpiando tabla..."))
         btn_layout.addWidget(self.clear_button)
 
         layout.addLayout(btn_layout)
@@ -125,8 +150,58 @@ class MarketshareVehiculosTab(QWidget):
         # cache para el icono punto y set previo de filas con icono aplicado
         self._dot_icon: Optional[QIcon] = None
         self._last_filled_rows: set[int] = set()
-        # loading dialog container
-        self._loading_dialog = None
+        # loading dialog reutilizable (instancia compartida)
+        try:
+            if LoadingDialog is not None:
+                try:
+                    from ..shared.loading_dialog import get_loading_dialog
+                except Exception:
+                    try:
+                        from tabs.shared.loading_dialog import get_loading_dialog
+                    except Exception:
+                        get_loading_dialog = None
+                if get_loading_dialog is not None:
+                    self.loading = get_loading_dialog(self)
+                else:
+                    self.loading = LoadingDialog(self)
+            else:
+                self.loading = None
+        except Exception:
+            self.loading = None
+        # referencias a worker/hilo de detección (inicializadas para que Pylance las conozca)
+        self._detect_worker: Optional[object] = None
+        self._detect_thread: Optional[object] = None
+
+    def _wrap_with_loading(self, func: Callable[..., Any], text: Optional[str] = None) -> Callable[[], None]:
+        """Devuelve un callable que muestra el diálogo de loading, ejecuta `func` y lo oculta.
+
+        `func` puede ser un método que acepte cero o más argumentos; el wrapper asume ninguno
+        (porque lo usaremos con señales `clicked`). Maneja excepciones y siempre oculta.
+        """
+        def _wrapped() -> None:
+            try:
+                try:
+                    self._show_loading(text or "Procesando...")
+                except Exception:
+                    pass
+                try:
+                    func()
+                except Exception as e:
+                    try:
+                        self.logger.exception("Error en acción de botón: %s", e)
+                    except Exception:
+                        pass
+                    try:
+                        QMessageBox.critical(self, "Error", f"Ocurrió un error: {e}")
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    self._hide_loading()
+                except Exception:
+                    pass
+
+        return _wrapped
 
     def add_row(self, values: Iterable[Optional[object]]):
         """Añade una fila a la tabla y escribe un log de la acción.
@@ -188,61 +263,12 @@ class MarketshareVehiculosTab(QWidget):
         s = ''.join(ch for ch in s if not unicodedata.combining(ch))
         return s
 
-    def load_models_from_db(self, db_key: str = 'compras_internacionales', query: Optional[str] = None) -> list:
-        """Carga una lista de modelos desde la base de datos. Devuelve lista de strings.
-
-        `query` puede ser personalizado; por defecto intenta algunas tablas comunes.
-        """
-        self.logger.info("Iniciando carga de modelos desde BD (db_key=%s)", db_key)
-        try:
-            conn = connect_db(db_key)
-            cursor = conn.cursor()
-            tried = []
-            default_queries = [
-                query,
-                "SELECT [MODELO] FROM [ComprasInternacionales].[kdx].[MarcaModeloMarketshare]",
-                "SELECT Modelo FROM ModelosVehiculos",
-                "SELECT Nombre FROM Modelos",
-                "SELECT model_name FROM vehicle_models",
-            ]
-            models = []
-            for q in default_queries:
-                if not q:
-                    continue
-                q = q.strip()
-                if q in tried:
-                    continue
-                tried.append(q)
-                try:
-                    self.logger.debug("Ejecutando query de modelos: %s", q)
-                    cursor.execute(q)
-                    rows = cursor.fetchall()
-                    if not rows:
-                        continue
-                    # first column assumed to be the model name
-                    models = [str(r[0]).strip() for r in rows if r and r[0] is not None]
-                    if models:
-                        break
-                except Exception as e:
-                    self.logger.debug("Query fallida (%s): %s", q, e)
-                    continue
-            try:
-                cursor.close()
-                conn.close()
-            except Exception:
-                pass
-            self.logger.info("Modelos cargados desde BD: %s modelos encontrados (db=%s)", len(models), db_key)
-            return models
-        except Exception as e:
-            self.logger.exception("Error conectando a BD para cargar modelos: %s", e)
-            return []
-
     def save_models_to_db(self, db_key: str = 'compras_internacionales') -> None:
         """Guarda en la BD los pares únicos (MARCA, MODELO) presentes en la tabla pero ausentes en la tabla de destino.
 
         Inserta en [ComprasInternacionales].[kdx].[MarcaModeloMarketshare] columnas [MARCA],[MODELO].
         """
-        # guard: si se llama con booleano por señal
+        # permitir señales booleanas
         if isinstance(db_key, bool):
             db_key = 'compras_internacionales'
         try:
@@ -270,6 +296,13 @@ class MarketshareVehiculosTab(QWidget):
                 try:
                     m_item = self.table.item(r, idx_modelo) if idx_modelo is not None else None
                     modelo = m_item.text().strip() if (m_item is not None and m_item.text() is not None) else ""
+                    # Omitir modelos marcados como N/A (y variantes como N.A. o N A)
+                    try:
+                        modelo_check = re.sub(r'[^A-Z0-9]', '', modelo.upper())
+                        if modelo_check == 'NA':
+                            continue
+                    except Exception:
+                        pass
                     if not modelo:
                         continue
                     marca = ""
@@ -305,7 +338,6 @@ class MarketshareVehiculosTab(QWidget):
             inserted_pairs: list[tuple[str, str]] = []
             for marca, modelo in to_insert:
                 try:
-                    # usar parámetros para evitar inyección
                     cursor.execute("INSERT INTO [ComprasInternacionales].[kdx].[MarcaModeloMarketshare] ([MARCA], [MODELO]) VALUES (?, ?)", marca, modelo)
                     inserted += 1
                     inserted_pairs.append((marca, modelo))
@@ -326,7 +358,6 @@ class MarketshareVehiculosTab(QWidget):
             if inserted == 0:
                 QMessageBox.information(self, "Guardar Modelos", f"No se insertaron modelos nuevos (candidatos: {len(to_insert)}).")
             else:
-                # mostrar hasta 50 ejemplos en el diálogo
                 max_show = 50
                 if inserted <= max_show:
                     details = '\n'.join([f"{m} | {mo}" for m, mo in inserted_pairs])
@@ -334,7 +365,6 @@ class MarketshareVehiculosTab(QWidget):
                 else:
                     details = '\n'.join([f"{m} | {mo}" for m, mo in inserted_pairs[:max_show]])
                     QMessageBox.information(self, "Guardar Modelos", f"Insertados {inserted} nuevos modelos (candidatos: {len(to_insert)}). Mostrando primeros {max_show}:\n\n{details}")
-            # log full list for audit
             try:
                 if inserted_pairs:
                     self.logger.info("Guardados %s modelos nuevos en BD (candidatos=%s): %s", inserted, len(to_insert), inserted_pairs)
@@ -345,6 +375,259 @@ class MarketshareVehiculosTab(QWidget):
         except Exception as e:
             self.logger.exception("Error guardando modelos en BD: %s", e)
             QMessageBox.critical(self, "Error", "Ocurrió un error guardando modelos. Revisa el log.")
+
+    def save_details(self, db_key: str = 'compras_internacionales') -> None:
+        """Alterna la visualización de un panel lateral derecho para 'Detalles'.
+
+        El panel se crea la primera vez y luego se muestra/oculta. Esta
+        implementación no persiste datos; solo muestra el panel lateral.
+        """
+        # permitir señales booleanas
+        if isinstance(db_key, bool):
+            db_key = 'compras_internacionales'
+        # Delegar a la lógica modularizada (sin fallback local)
+        try:
+            self.logger.debug("save_details llamado; lv_save_details disponible=%s", lv_save_details is not None)
+            if lv_save_details is None:
+                QMessageBox.information(self, "Detalles", "La lógica de 'Guardar Detalles' no está disponible.")
+                return
+            try:
+                lv_save_details.handle_save_details(self, db_key)
+            except Exception as e:
+                self.logger.exception("Error delegando a lv_save_details: %s", e)
+                QMessageBox.critical(self, "Error", "Ocurrió un error mostrando el panel de detalles. Revisa el log.")
+        except Exception as e:
+            try:
+                self.logger.exception("Error en save_details: %s", e)
+            except Exception:
+                pass
+
+    def save_table_to_sql(self, db_key: str = 'compras_internacionales') -> None:
+        """Guarda las filas de la tabla en la tabla SQL [ComprasInternacionales].[CI].[MarketshareVehiculo].
+
+        Se intenta mapear las columnas de la UI a los nombres de columnas SQL listados.
+        """
+        # permitir señales booleanas
+        if isinstance(db_key, bool):
+            db_key = 'compras_internacionales'
+        try:
+            # columnas objetivo tal como fueron provistas por el usuario
+            sql_cols = [
+                "NRO_RUC",
+                "NOMBRE DEL IMPORTADOR",
+                "DESCRIPCIÓN",
+                "ADUANA ",
+                "PAIS DE ORIGEN",
+                "PESO BRUTO",
+                "VALOR_CIF",
+                "CANTIDAD",
+                "UNIDAD DE MEDIDA",
+                "UNIDAD DE MEDIDA2",
+                "MARCA",
+                "MODELO",
+                "CATEGORIA",
+                "POLIZA",
+                "FECHA",
+                "MES",
+                "AÑO",
+                "SAC",
+                "CONSIGNATARIO",
+                "EXPORTADOR",
+                "Selecc",
+                "ESTADO",
+            ]
+
+            # preparar mapeo columna UI -> índice
+            header_norms = {}
+            for i in range(self.table.columnCount()):
+                hi = self.table.horizontalHeaderItem(i)
+                if hi is None:
+                    continue
+                header_norms[i] = self._normalize(hi.text())
+
+            import re as _re
+            col_to_idx: dict[str, Optional[int]] = {}
+            for col in sql_cols:
+                target_norm = self._normalize(col)
+                # clean: remove spaces, underscores and hyphens for loose matching
+                tclean = _re.sub(r"[\s_\-]", "", target_norm)
+                found = None
+                for idx, hnorm in header_norms.items():
+                    hclean = _re.sub(r"[\s_\-]", "", hnorm)
+                    if hnorm == target_norm or hclean == tclean:
+                        found = idx
+                        break
+                col_to_idx[col] = found
+
+            # construir query con columnas entre corchetes
+            cols_bracketed = ','.join([f"[{c}]" for c in sql_cols])
+            placeholders = ','.join(['?'] * len(sql_cols))
+            insert_sql = f"INSERT INTO [ComprasInternacionales].[CI].[MarketshareVehiculo] ({cols_bracketed}) VALUES ({placeholders})"
+
+            conn = connect_db(db_key)
+            cursor = conn.cursor()
+            inserted = 0
+            failed = 0
+            errors: list[str] = []
+
+            total_rows = self.table.rowCount()
+            if total_rows == 0:
+                QMessageBox.information(self, "Guardar en SQL", "No hay filas en la tabla para guardar.")
+                try:
+                    cursor.close()
+                    conn.close()
+                except Exception:
+                    pass
+                return
+
+            def _parse_date(val):
+                # intenta convertir varios formatos comunes a datetime, devuelve None si no es posible
+                try:
+                    if val is None:
+                        return None
+                    # si ya es datetime
+                    import datetime as _dt
+                    if isinstance(val, _dt.datetime) or isinstance(val, _dt.date):
+                        # pyodbc acepta datetime.datetime; si es date, convertir a datetime
+                        if isinstance(val, _dt.date) and not isinstance(val, _dt.datetime):
+                            return _dt.datetime(val.year, val.month, val.day)
+                        return val
+                    # si es string con patrón ISO (YYYY-MM-DD...) forzar dayfirst=False para evitar warning
+                    try:
+                        if isinstance(val, str):
+                            s = val.strip()
+                            if re.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}', s):
+                                parsed = pd.to_datetime(s, errors='coerce', dayfirst=False)
+                                if pd.isna(parsed):
+                                    # intentar formatos explícitos comunes
+                                    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d', '%Y/%m/%d'):
+                                        try:
+                                            parsed = pd.to_datetime(s, format=fmt, errors='coerce')
+                                            if not pd.isna(parsed):
+                                                break
+                                        except Exception:
+                                            continue
+                                if pd.isna(parsed):
+                                    parsed = None
+                                else:
+                                    return parsed.to_pydatetime()
+
+                        # usar pandas para parsing con dayfirst heurístico
+                        parsed = pd.to_datetime(val, errors='coerce', dayfirst=True)
+                        if pd.isna(parsed):
+                            parsed = pd.to_datetime(val, errors='coerce', dayfirst=False)
+                        if pd.isna(parsed):
+                            # intento adicional para valores numéricos tipo Excel serial
+                            if isinstance(val, (int, float)):
+                                try:
+                                    parsed = pd.to_datetime(val, unit='D', origin='1899-12-30', errors='coerce')
+                                except Exception:
+                                    parsed = pd.NaT
+                        if pd.isna(parsed):
+                            return None
+                        return parsed.to_pydatetime()
+                    except Exception:
+                        return None
+                except Exception:
+                    return None
+
+            def _parse_float(val):
+                try:
+                    if val is None:
+                        return None
+                    if isinstance(val, (int, float)):
+                        return float(val)
+                    s = str(val).strip()
+                    if s == "":
+                        return None
+                    # eliminar símbolos comunes
+                    for ch in ['$', 'USD', 'EUR', '€']:
+                        s = s.replace(ch, '')
+                    s = s.replace('\u00A0', '')  # no-break space
+                    s = s.strip()
+                    # decide separadores: si contiene ambos '.' y ','
+                    if '.' in s and ',' in s:
+                        # si la última coma está después del último punto, tratar la coma como decimal
+                        if s.rfind(',') > s.rfind('.'):
+                            s = s.replace('.', '')
+                            s = s.replace(',', '.')
+                        else:
+                            s = s.replace(',', '')
+                    else:
+                        # solo coma -> coma decimal
+                        if ',' in s:
+                            s = s.replace(',', '.')
+                    # quitar espacios remanentes
+                    s = s.replace(' ', '')
+                    return float(s)
+                except Exception:
+                    return None
+
+            for r in range(total_rows):
+                try:
+                    values = []
+                    for col in sql_cols:
+                        idx = col_to_idx.get(col)
+                        if idx is None:
+                            values.append(None)
+                            continue
+                        try:
+                            it = self.table.item(r, idx)
+                            raw = it.text().strip() if (it is not None and it.text() is not None) else None
+                        except Exception:
+                            raw = None
+
+                        # Normalizaciones por tipo de columna
+                        if col == 'FECHA':
+                            parsed_date = _parse_date(raw)
+                            values.append(parsed_date)
+                            continue
+                        if col in ('MES', 'AÑO', 'PESO BRUTO', 'VALOR_CIF', 'CANTIDAD', 'POLIZA', 'SAC'):
+                            # columnas numéricas en la tabla (float)
+                            num = _parse_float(raw)
+                            values.append(num)
+                            continue
+                        # default: insertar texto (None si vacío)
+                        v = raw if (raw is not None and raw != "") else None
+                        values.append(v)
+                    try:
+                        cursor.execute(insert_sql, tuple(values))
+                        inserted += 1
+                    except Exception as e:
+                        failed += 1
+                        errors.append(f"Fila {r+1}: {e}")
+                        self.logger.exception("Error insertando fila %s: %s", r+1, e)
+                        continue
+                except Exception as e:
+                    failed += 1
+                    errors.append(f"Fila {r+1}: {e}")
+                    self.logger.exception("Error procesando fila %s para inserción: %s", r+1, e)
+                    continue
+
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                cursor.close()
+                conn.close()
+            except Exception:
+                pass
+
+            # Reporte al usuario
+            if inserted == 0:
+                QMessageBox.information(self, "Guardar en SQL", f"No se insertaron filas. Errores: {failed}.")
+            else:
+                msg = f"Insertadas {inserted} filas. Errores: {failed}."
+                if failed > 0:
+                    # si hay muchos errores, no mostrar todos en un diálogo simple
+                    sample = '\n'.join(errors[:20])
+                    msg = msg + "\nEjemplos de errores:\n" + sample
+                QMessageBox.information(self, "Guardar en SQL", msg)
+            self.logger.info("save_table_to_sql: insertadas=%s fallidas=%s (total filas=%s)", inserted, failed, total_rows)
+        except Exception as e:
+            self.logger.exception("Error guardando tabla en SQL: %s", e)
+            QMessageBox.critical(self, "Error", "Ocurrió un error guardando la tabla en SQL. Revisa el log.")
 
     def show_filter_menu(self, col: int):
         """Muestra un menú enriquecido con búsqueda y valores únicos para la columna indicada."""
@@ -532,16 +815,33 @@ class MarketshareVehiculosTab(QWidget):
                     header_item = self.table.horizontalHeaderItem(i)
                     col_text = header_item.text() if header_item is not None else ""
                     text_width = fm.horizontalAdvance(col_text)
+                    # reservar área a la derecha para el icono de filtro
+                    gap = 6
+                    reserved_right = btn.width() + gap + 4
+                    # Si el texto ocupa gran parte de la sección, ampliar la sección
+                    try:
+                        if text_width + reserved_right > w:
+                            new_w = int(text_width + reserved_right + 8)
+                            try:
+                                # Preferir ajustar directamente el ancho de la columna en la tabla
+                                self.table.setColumnWidth(i, new_w)
+                                w = new_w
+                            except Exception:
+                                try:
+                                    header.resizeSection(i, new_w)
+                                    w = new_w
+                                except Exception:
+                                    # fallback silencioso
+                                    pass
+                    except Exception:
+                        pass
                     # calcular posición del texto (centrado o con margen mínimo)
                     min_margin = 6
                     text_left = x + max(min_margin, (w - text_width) // 2)
                     text_right = text_left + text_width
-                    gap = 6
-                    bx = text_right + gap
-                    # asegurar que el botón no salga de la sección
+                    # colocar el botón siempre en la zona derecha reservada
                     max_bx = x + w - btn.width() - 4
-                    if bx > max_bx:
-                        bx = max_bx
+                    bx = max_bx
                     by = y + (h - btn.height()) // 2
                     btn.move(bx, by)
                 except Exception:
@@ -731,351 +1031,23 @@ class MarketshareVehiculosTab(QWidget):
             self.logger.exception("Error en menú contextual: %s", e)
 
     def identify_models(self, db_key: str = 'compras_internacionales', query: Optional[str] = None, models_list: Optional[list] = None):
-        """Identifica y rellena la columna `MODELO` buscando coincidencias en
-        `UNIDAD DE MEDIDA` y `UNIDAD DE MEDIDA2` usando una lista de modelos.
-        Si `models_list` es None, intenta cargar desde la BD usando `db_key` y `query`.
-        """
-        # Guard: si se recibe un booleano (por ejemplo la señal clicked), usar el valor por defecto
+        """Inicia la detección (lanza Fase 1). El encadenamiento a Fase 2 lo maneja `detect_models` internamente."""
+        # permitir señales booleanas
         if isinstance(db_key, bool):
-            self.logger.debug("identify_models recibió un booleano para db_key; usando valor por defecto 'compras_internacionales'")
             db_key = 'compras_internacionales'
-        self.logger.info("Iniciando identificación de modelos (db_key=%s)", db_key)
-        # Mostrar diálogo de carga (no bloqueante)
         try:
-            self._show_loading("Detectando modelos...")
+            from .Logica_Vehiculos.model_detection import detect_models
         except Exception:
-            pass
-        try:
-            if models_list is None:
-                models = self.load_models_from_db(db_key=db_key, query=query)
-            else:
-                models = models_list
-            if not models:
-                self.logger.warning("No se encontraron modelos para identificar")
-                QMessageBox.warning(self, "Modelos", "No se encontraron modelos en la base de datos.")
-                return
-
-            # Normalizar modelos y ordenar por longitud descendente para priorizar coincidencias largas
-            norm_models = [(m, self._normalize(m)) for m in models]
-            norm_models.sort(key=lambda x: len(x[1]), reverse=True)
-
-            # Encontrar índices de columnas relevantes
-            col_names = []
-            for i in range(self.table.columnCount()):
-                header_item = self.table.horizontalHeaderItem(i)
-                col_names.append(header_item.text() if header_item is not None else "")
             try:
-                idx_unidad1 = col_names.index('UNIDAD DE MEDIDA')
-            except ValueError:
-                idx_unidad1 = None
-            try:
-                idx_unidad2 = col_names.index('UNIDAD DE MEDIDA2')
-            except ValueError:
-                idx_unidad2 = None
-            try:
-                idx_modelo = col_names.index('MODELO')
-            except ValueError:
-                idx_modelo = None
-
-            if idx_modelo is None:
-                self.logger.error("Columna 'MODELO' no encontrada en la tabla; abortando identificación")
-                QMessageBox.critical(self, "Error", "Columna 'MODELO' no encontrada en la tabla.")
-                return
-
-            matched = 0
-            total = self.table.rowCount()
-            for r in range(total):
-                unidad_vals = []
-                if idx_unidad1 is not None:
-                    item = self.table.item(r, idx_unidad1)
-                    unidad_vals.append(item.text() if item is not None else "")
-                if idx_unidad2 is not None:
-                    item = self.table.item(r, idx_unidad2)
-                    unidad_vals.append(item.text() if item is not None else "")
-
-                combined = ' '.join([self._normalize(v) for v in unidad_vals if v])
-                found_model = None
-                for orig, norm in norm_models:
-                    if not norm:
-                        continue
-                    # match whole words only to avoid partial matches (e.g. 'RIO' in 'SUPERIOR')
-                    try:
-                        if re.search(r"\b" + re.escape(norm) + r"\b", combined):
-                            found_model = orig
-                            break
-                    except Exception:
-                        # fallback to substring if regex fails for any reason
-                        if norm in combined:
-                            found_model = orig
-                            break
-
-                if found_model:
-                    # escribir en la columna MODELO
-                    try:
-                        self.table.setItem(r, idx_modelo, QTableWidgetItem(str(found_model)))
-                        matched += 1
-                    except Exception as e:
-                        self.logger.exception("Error escribiendo modelo en fila %s: %s", r, e)
-
-            self.logger.info("Identificación de modelos completada: %s/%s filas con modelo asignado", matched, total)
-            # Segunda fase: completar modelos vacíos usando agrupación por PESO_BRUTO + VALOR_CIF
-            try:
-                # localizar índices de PESO_BRUTO y VALOR_CIF
-                try:
-                    idx_peso = col_names.index('PESO_BRUTO')
-                except ValueError:
-                    idx_peso = None
-                try:
-                    idx_val = col_names.index('VALOR_CIF')
-                except ValueError:
-                    idx_val = None
-
-                def _norm_val(x: Any) -> str:
-                    if x is None:
-                        return ""
-                    # si es numérico, normalizar formato
-                    try:
-                        if isinstance(x, (int, float)):
-                            # eliminar .0 para enteros
-                            fx = float(x)
-                            if fx.is_integer():
-                                return str(int(fx))
-                            return f"{fx:.6f}".rstrip('0').rstrip('.')
-                    except Exception:
-                        pass
-                    s = str(x).strip()
-                    return s
-
-                # construir map de (peso, valor) -> Counter(modelo) para filas con modelo
-                pv_to_models: dict[tuple[str, str], Counter] = {}
-                for r in range(total):
-                    try:
-                        m_item = self.table.item(r, idx_modelo) if idx_modelo is not None else None
-                        m_text = m_item.text().strip() if (m_item is not None and m_item.text() is not None) else ""
-                        if not m_text:
-                            continue
-                        peso_item = self.table.item(r, idx_peso) if idx_peso is not None else None
-                        peso = _norm_val(peso_item.text() if (peso_item is not None and peso_item.text() is not None) else None)
-                        valor_item = self.table.item(r, idx_val) if idx_val is not None else None
-                        valor = _norm_val(valor_item.text() if (valor_item is not None and valor_item.text() is not None) else None)
-                        key = (peso, valor)
-                        pv_to_models.setdefault(key, Counter())[m_text] += 1
-                    except Exception:
-                        continue
-
-                # ahora asignar a filas con modelo vacío si existe coincidencia exacta en pv_to_models
-                filled = 0
-                for r in range(total):
-                    try:
-                        m_item = self.table.item(r, idx_modelo) if idx_modelo is not None else None
-                        m_text = m_item.text().strip() if (m_item is not None and m_item.text() is not None) else ""
-                        if m_text:
-                            continue
-                        peso_item = self.table.item(r, idx_peso) if idx_peso is not None else None
-                        peso = _norm_val(peso_item.text() if (peso_item is not None and peso_item.text() is not None) else None)
-                        valor_item = self.table.item(r, idx_val) if idx_val is not None else None
-                        valor = _norm_val(valor_item.text() if (valor_item is not None and valor_item.text() is not None) else None)
-                        key = (peso, valor)
-                        cnt = pv_to_models.get(key)
-                        if cnt:
-                            # elegir el modelo más frecuente
-                            model_choice, _ = cnt.most_common(1)[0]
-                            try:
-                                self.table.setItem(r, idx_modelo, QTableWidgetItem(str(model_choice)))
-                                filled += 1
-                                try:
-                                    self.filled_rows.add(r)
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                    except Exception:
-                        continue
-                if filled:
-                    self.logger.info("Completados %s modelos vacíos usando PESO_BRUTO+VALOR_CIF", filled)
-                # marcar filas que fueron completadas
-                try:
-                    # filled_rows fue poblado en el bucle anterior
-                    self.update_row_markers()
-                except Exception:
-                    pass
-
-                # Tercera fase: inferir MARCA para filas con MODELO pero MARCA vacía
-                try:
-                    # localizar índice de MARCA si existe
-                    try:
-                        idx_marca = col_names.index('MARCA')
-                    except ValueError:
-                        idx_marca = None
-
-                    # construir mapeo modelo_normalizado -> Counter(marca) desde la propia tabla
-                    model_to_brands: dict[str, Counter] = {}
-                    for r in range(total):
-                        try:
-                            m_item = self.table.item(r, idx_modelo) if idx_modelo is not None else None
-                            marca_item = self.table.item(r, idx_marca) if idx_marca is not None else None
-                            modelo_txt = m_item.text().strip() if (m_item is not None and m_item.text() is not None) else ""
-                            marca_txt = marca_item.text().strip() if (marca_item is not None and marca_item.text() is not None) else ""
-                            if not modelo_txt or not marca_txt:
-                                continue
-                            norm_mod = self._normalize(modelo_txt)
-                            model_to_brands.setdefault(norm_mod, Counter())[marca_txt] += 1
-                        except Exception:
-                            continue
-
-                    # complementar con datos de BD (si es posible) para enriquecer el mapeo
-                    try:
-                        conn2 = connect_db(db_key)
-                        cur2 = conn2.cursor()
-                        try:
-                            cur2.execute("SELECT [MARCA], [MODELO] FROM [ComprasInternacionales].[kdx].[MarcaModeloMarketshare]")
-                            rows = cur2.fetchall()
-                            for r in rows:
-                                try:
-                                    marca_db = str(r[0]).strip() if r and r[0] is not None else ""
-                                    modelo_db = str(r[1]).strip() if r and r[1] is not None else ""
-                                    if not modelo_db or not marca_db:
-                                        continue
-                                    norm_mod_db = self._normalize(modelo_db)
-                                    model_to_brands.setdefault(norm_mod_db, Counter())[marca_db] += 1
-                                except Exception:
-                                    continue
-                        except Exception:
-                            pass
-                        try:
-                            cur2.close()
-                            conn2.close()
-                        except Exception:
-                            pass
-                    except Exception:
-                        # si falla la conexión, continuar con lo que haya en la tabla
-                        pass
-
-                    # ahora rellenar MARCA donde esté vacía y MODELO presente
-                    marca_filled = 0
-                    if idx_marca is not None:
-                        for r in range(total):
-                            try:
-                                m_item = self.table.item(r, idx_modelo)
-                                marca_item = self.table.item(r, idx_marca)
-                                modelo_txt = m_item.text().strip() if (m_item is not None and m_item.text() is not None) else ""
-                                marca_txt = marca_item.text().strip() if (marca_item is not None and marca_item.text() is not None) else ""
-                                if not modelo_txt or marca_txt:
-                                    continue
-                                norm_mod = self._normalize(modelo_txt)
-                                cnt = model_to_brands.get(norm_mod)
-                                if cnt:
-                                    brand_choice, _ = cnt.most_common(1)[0]
-                                    try:
-                                        if marca_item is None:
-                                            self.table.setItem(r, idx_marca, QTableWidgetItem(brand_choice))
-                                        else:
-                                            marca_item.setText(brand_choice)
-                                        marca_filled += 1
-                                    except Exception:
-                                        continue
-                            except Exception:
-                                continue
-                    if marca_filled:
-                        self.logger.info("Completadas %s marcas vacías basadas en MODELO", marca_filled)
-                except Exception as e:
-                    self.logger.exception("Error completando MARCA por MODELO: %s", e)
-                # Cuarta fase: usar tabla DATOS para detectar pares MARCA/MODELO por palabra
-                try:
-                    token_map: dict[str, Counter] = {}
-                    try:
-                        conn3 = connect_db(db_key)
-                        cur3 = conn3.cursor()
-                        try:
-                            cur3.execute("SELECT [MARCA], [MODELO], [DATOS] FROM [ComprasInternacionales].[kdx].[MarcaModeloDatosMarketshareVehículos]")
-                            rows = cur3.fetchall()
-                            for rr in rows:
-                                try:
-                                    marca_db = str(rr[0]).strip() if rr and rr[0] is not None else ""
-                                    modelo_db = str(rr[1]).strip() if rr and rr[1] is not None else ""
-                                    datos_db = str(rr[2]).strip() if rr and rr[2] is not None else ""
-                                    if not datos_db:
-                                        continue
-                                    norm = self._normalize(datos_db)
-                                    parts = re.findall(r"\w+", norm)
-                                    for tok in parts:
-                                        token_map.setdefault(tok, Counter())[(marca_db, modelo_db)] += 1
-                                except Exception:
-                                    continue
-                        except Exception as e:
-                            self.logger.debug("No se pudo leer tabla DATOS: %s", e)
-                        try:
-                            cur3.close()
-                            conn3.close()
-                        except Exception:
-                            pass
-                    except Exception:
-                        # no hay BD o fallo; continuar
-                        pass
-
-                    # ahora intentar asignar usando tokens si hay mapa
-                    assigned_from_datos = 0
-                    if token_map:
-                        for r in range(total):
-                            try:
-                                # asignar solo si MODELO vacío
-                                m_item = self.table.item(r, idx_modelo) if idx_modelo is not None else None
-                                m_text = m_item.text().strip() if (m_item is not None and m_item.text() is not None) else ""
-                                if m_text:
-                                    continue
-                                # construir tokens desde UNIDAD DE MEDIDA y UNIDAD DE MEDIDA2
-                                unit_texts = []
-                                if idx_unidad1 is not None:
-                                    it1 = self.table.item(r, idx_unidad1)
-                                    unit_texts.append(it1.text() if it1 is not None and it1.text() is not None else "")
-                                if idx_unidad2 is not None:
-                                    it2 = self.table.item(r, idx_unidad2)
-                                    unit_texts.append(it2.text() if it2 is not None and it2.text() is not None else "")
-                                combined = ' '.join([self._normalize(u) for u in unit_texts if u])
-                                if not combined:
-                                    continue
-                                toks = re.findall(r"\w+", combined)
-                                cand = Counter()
-                                for t in toks:
-                                    if t in token_map:
-                                        cand.update(token_map[t])
-                                if not cand:
-                                    continue
-                                (brand_choice, model_choice), _ = cand.most_common(1)[0]
-                                # escribir MODELO y MARCA
-                                try:
-                                    if idx_modelo is not None:
-                                        self.table.setItem(r, idx_modelo, QTableWidgetItem(model_choice))
-                                    if idx_marca is not None:
-                                        mi = self.table.item(r, idx_marca)
-                                        if mi is None:
-                                            self.table.setItem(r, idx_marca, QTableWidgetItem(brand_choice))
-                                        else:
-                                            mi.setText(brand_choice)
-                                    assigned_from_datos += 1
-                                    try:
-                                        self.filled_rows.add(r)
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    continue
-                            except Exception:
-                                continue
-                    if assigned_from_datos:
-                        self.logger.info("Asignados %s modelos/marcas desde tabla DATOS por coincidencia de palabra", assigned_from_datos)
-                except Exception as e:
-                    self.logger.exception("Error asignando desde tabla DATOS: %s", e)
-            except Exception as e:
-                self.logger.exception("Error completando modelos vacíos por agrupación: %s", e)
-
-            QMessageBox.information(self, "Identificación completa", f"Modelos identificados: {matched} de {total} filas. Modelos completados por agrupación: {filled if 'filled' in locals() else 0}.")
-        except Exception as e:
-            self.logger.exception("Error en identify_models: %s", e)
-        finally:
-            try:
-                self._hide_loading()
+                from tabs.marketshare.Logica_Vehiculos.model_detection import detect_models
             except Exception:
-                pass
+                detect_models = None
+        if detect_models is None:
+            QMessageBox.critical(self, "Error", "No se pudo cargar el módulo de detección de modelos.")
+            return
+        return detect_models(self, db_key=db_key, query=query, models_list=models_list, phase=1)
+
+    # removed interactive phase chooser; detection phases are chained in the detection module
 
     def _make_dot_icon(self, size: int = 10, color: str = '#80deea') -> QIcon:
         """Crea un QIcon con un punto circular del color dado."""
@@ -1134,102 +1106,260 @@ class MarketshareVehiculosTab(QWidget):
         except Exception as e:
             self.logger.exception("Error actualizando marcadores de fila: %s", e)
 
+    def _set_ui_locked(self, locked: bool) -> None:
+        """Deshabilita/rehabilita controles interactivos durante operaciones en background.
+
+        `locked=True` desactiva la tabla, botones principales y los botones de filtro.
+        """
+        try:
+            # tabla
+            try:
+                self.table.setDisabled(locked)
+            except Exception:
+                pass
+            # botones principales
+            try:
+                for n in ('load_files_button', 'detect_models_button', 'save_models_button', 'clear_button'):
+                    btn = getattr(self, n, None)
+                    if btn is not None:
+                        btn.setDisabled(locked)
+            except Exception:
+                pass
+            # botones de filtro (en header)
+            try:
+                for b in self.filter_buttons:
+                    try:
+                        b.setDisabled(locked)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # Handlers para la detección en background (QThread)
+    def _on_detection_row_assigned(self, row: int, model: str) -> None:
+        """Maneja la señal del worker indicando que una fila debe recibir MODELO."""
+        try:
+            # localizar índice MODELO cada vez por si cambió el esquema
+            idx_modelo = None
+            for i in range(self.table.columnCount()):
+                hi = self.table.horizontalHeaderItem(i)
+                if hi is not None and hi.text().strip().upper() == 'MODELO':
+                    idx_modelo = i
+                    break
+            if idx_modelo is None:
+                self.logger.error("_on_detection_row_assigned: columna MODELO no encontrada")
+                return
+            item = QTableWidgetItem(str(model))
+            self.table.setItem(row, idx_modelo, item)
+        except Exception:
+            self.logger.exception("Error asignando modelo en fila %s", row)
+
+    def _on_detection_row_assigned_vin(self, row: int, marca: str, modelo: str) -> None:
+        """Maneja la señal del worker de VIN indicando que una fila debe recibir MARCA y MODELO."""
+        try:
+            # localizar índices MODELO y MARCA
+            idx_modelo = None
+            idx_marca = None
+            for i in range(self.table.columnCount()):
+                hi = self.table.horizontalHeaderItem(i)
+                if hi is None:
+                    continue
+                txt = hi.text().strip().upper()
+                if txt == 'MODELO':
+                    idx_modelo = i
+                elif txt == 'MARCA':
+                    idx_marca = i
+                if idx_modelo is not None and idx_marca is not None:
+                    break
+            if idx_modelo is None and idx_marca is None:
+                self.logger.error("_on_detection_row_assigned_vin: columnas MARCA/MODELO no encontradas")
+                return
+            if idx_marca is not None:
+                try:
+                    self.table.setItem(row, idx_marca, QTableWidgetItem(str(marca)))
+                except Exception:
+                    pass
+            if idx_modelo is not None:
+                try:
+                    self.table.setItem(row, idx_modelo, QTableWidgetItem(str(modelo)))
+                except Exception:
+                    pass
+        except Exception as e:
+            self.logger.exception("Error asignando MARCA/MODELO en fila %s: %s", row, e)
+
+    def _on_detection_progress(self, value: int) -> None:
+        # Intencionalmente silencioso: evitar logs de progreso por fila
+        return
+
+    def _on_detection_log(self, text: str) -> None:
+        # Intencionalmente silencioso: evitar logs detallados por fila
+        return
+
+    def _on_detection_error(self, message: str) -> None:
+        # Registrar y notificar al usuario
+        try:
+            self.logger.error("Error en DetectWorker: %s", message)
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(self, "Error en detección", str(message))
+        except Exception:
+            pass
+        # Ocultar diálogo y limpiar hilo/worker si existen
+        try:
+            # re-enable UI interactions
+            try:
+                self._set_ui_locked(False)
+            except Exception:
+                pass
+            self._hide_loading()
+        except Exception:
+            pass
+        try:
+            wk = getattr(self, '_detect_worker', None)
+            if wk is not None:
+                try:
+                    wk.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            th = getattr(self, '_detect_thread', None)
+            if th is not None:
+                try:
+                    th.quit()
+                    th.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            del self._detect_worker
+        except Exception:
+            pass
+        try:
+            del self._detect_thread
+        except Exception:
+            pass
+
+    def _on_detection_finished(self, matched: int) -> None:
+        try:
+            self.logger.info("DetectWorker finalizó: %s coincidencias asignadas", matched)
+        except Exception:
+            pass
+        try:
+            # re-enable UI
+            try:
+                self._set_ui_locked(False)
+            except Exception:
+                pass
+            self._hide_loading()
+        except Exception:
+            pass
+        try:
+            # actualizar marcadores visuales si se completaron filas
+            self.update_row_markers()
+        except Exception:
+            pass
+        # limpiar hilo/worker si existen
+        try:
+            wk = getattr(self, '_detect_worker', None)
+            if wk is not None:
+                try:
+                    wk.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            th = getattr(self, '_detect_thread', None)
+            if th is not None:
+                try:
+                    th.quit()
+                    th.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            del self._detect_worker
+        except Exception:
+            pass
+        try:
+            del self._detect_thread
+        except Exception:
+            pass
+
     def _show_loading(self, text: str = "Cargando...", gif_path: Optional[str] = None) -> None:
         """Muestra un diálogo centrado con `loading.gif` (si existe) y texto opcional."""
         try:
-            # si ya existe, solo actualizar texto y mostrar
-            if self._loading_dialog is not None:
+            ld = getattr(self, 'loading', None)
+            if LoadingDialog is not None and isinstance(ld, LoadingDialog):
                 try:
-                    self._loading_dialog.show()
+                    ld.show(text=text, gif_path=gif_path)
                     return
                 except Exception:
-                    self._loading_dialog = None
-
-            dlg = QDialog(self)
-            dlg.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint | QtCore.Qt.WindowType.Dialog)
-            dlg.setModal(False)
-            layout = QVBoxLayout(dlg)
-            layout.setContentsMargins(12, 12, 12, 12)
-            # determine gif path: prefer explicit gif_path, otherwise look for loading.gif next to this module
-            if not gif_path:
-                try:
-                    base_dir = os.path.dirname(__file__)
-                    candidate = os.path.join(base_dir, 'loading.gif')
-                    if os.path.exists(candidate):
-                        gif_path = candidate
-                    else:
-                        # fallback to parent 'Iconos' folder if present
-                        candidate2 = os.path.join(os.path.dirname(base_dir), 'Iconos', 'loading.gif')
-                        if os.path.exists(candidate2):
-                            gif_path = candidate2
-                except Exception:
-                    gif_path = None
-
-            # attempt to load gif
-            label = QLabel(dlg)
-            movie = None
-            try:
-                if gif_path and os.path.exists(gif_path):
-                    movie = QMovie(gif_path)
-                    label.setMovie(movie)
-                    movie.start()
-                else:
-                    label.setText(text)
-                    label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            except Exception:
-                label.setText(text)
-                label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            layout.addWidget(label)
-            # size and center relative to parent
-            dlg.adjustSize()
-            parent_rect = self.geometry()
-            global_pos = self.mapToGlobal(parent_rect.topLeft())
-            x = global_pos.x() + (parent_rect.width() - dlg.width()) // 2
-            y = global_pos.y() + (parent_rect.height() - dlg.height()) // 2
-            dlg.move(int(x), int(y))
-            dlg.show()
-            # ensure the dialog is on top and process events so it renders immediately
-            try:
-                dlg.raise_()
-                dlg.activateWindow()
-            except Exception:
-                pass
-            try:
-                QApplication.processEvents()
-            except Exception:
-                pass
-            # keep reference to movie to avoid GC stopping animation
-            try:
-                self._loading_movie = movie
-            except Exception:
-                self._loading_movie = None
-            self._loading_dialog = dlg
+                    self.logger.debug("LoadingDialog disponible pero falló show()")
+            else:
+                self.logger.debug("LoadingDialog no disponible; omitiendo diálogo de carga")
         except Exception as e:
             self.logger.exception("Error mostrando diálogo de carga: %s", e)
 
+    # Nota: la lógica del panel de detalles ahora está totalmente delegada a
+    # `tabs.marketshare.Logica_Vehiculos.save_details`. Las funciones locales
+    # de creación/mostrar/ocultar fueron eliminadas para evitar duplicidad.
+
     def _hide_loading(self) -> None:
         try:
-            if self._loading_dialog is not None:
+            ld = getattr(self, 'loading', None)
+            if LoadingDialog is not None and isinstance(ld, LoadingDialog):
                 try:
-                    self._loading_dialog.close()
+                    ld.hide()
+                    return
+                except Exception:
+                    self.logger.debug("LoadingDialog disponible pero falló hide()")
+            else:
+                self.logger.debug("LoadingDialog no disponible; nothing to hide")
+        except Exception as e:
+            self.logger.exception("Error ocultando diálogo de carga: %s", e)
+
+    def _find_loading_gif(self) -> Optional[str]:
+        """Busca `loading.gif` en ubicaciones probables (módulo, Iconos en padres).
+
+        Recorre hacia arriba hasta 6 niveles buscando una carpeta `Iconos` con `loading.gif`,
+        y también verifica si hay `loading.gif` junto al módulo.
+        """
+        # delegar a LoadingDialog si está disponible
+        try:
+            if LoadingDialog is not None:
+                try:
+                    return LoadingDialog.find_loading_gif()
                 except Exception:
                     pass
-                # stop movie if any
-                try:
-                    if hasattr(self, '_loading_movie') and self._loading_movie is not None:
-                        try:
-                            self._loading_movie.stop()
-                        except Exception:
-                            pass
-                        try:
-                            del self._loading_movie
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                self._loading_dialog = None
         except Exception:
             pass
+        try:
+            cur = os.path.dirname(__file__)
+            candidate = os.path.join(cur, 'loading.gif')
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+            for _ in range(6):
+                candidate = os.path.join(cur, 'Iconos', 'loading.gif')
+                if os.path.exists(candidate):
+                    return os.path.abspath(candidate)
+                candidate2 = os.path.join(cur, 'loading.gif')
+                if os.path.exists(candidate2):
+                    return os.path.abspath(candidate2)
+                parent = os.path.dirname(cur)
+                if not parent or parent == cur:
+                    break
+                cur = parent
+        except Exception:
+            pass
+        return None
 
     def load_from_dataframe(self, df: pd.DataFrame):
         """Carga datos desde un DataFrame en la tabla y registra la operación."""
@@ -1285,6 +1415,19 @@ class MarketshareVehiculosTab(QWidget):
             if not files:
                 self.logger.debug("Diálogo de selección de archivos cancelado o sin selección")
                 return
+
+            # Mostrar diálogo de carga inmediatamente después de elegir archivos
+            try:
+                base_dir = os.path.dirname(__file__)
+                gif_path = os.path.abspath(os.path.join(base_dir, '..', 'Iconos', 'loading.gif'))
+                if not os.path.exists(gif_path):
+                    gif_path = os.path.abspath(os.path.join(os.path.dirname(base_dir), 'Iconos', 'loading.gif'))
+                try:
+                    self._show_loading("Cargando archivos...", gif_path=gif_path if os.path.exists(gif_path) else None)
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
             total_loaded = 0
             for file_path in files:
@@ -1344,8 +1487,19 @@ class MarketshareVehiculosTab(QWidget):
                             values.append(val)
                         self.add_row(values)
                         file_count += 1
+                        # permitir que la UI procese eventos para mantener la animación del GIF
+                        try:
+                            if file_count % 100 == 0:
+                                QApplication.processEvents()
+                        except Exception:
+                            pass
 
                     total_loaded += file_count
+                    # procesar eventos también después de cada archivo para evitar que la UI se congele
+                    try:
+                        QApplication.processEvents()
+                    except Exception:
+                        pass
                 except Exception as file_exc:
                     self.logger.exception("Error procesando archivo %s: %s", file_path, file_exc)
             # Ajustar anchos de columnas una vez terminada la carga de archivos
@@ -1363,3 +1517,8 @@ class MarketshareVehiculosTab(QWidget):
             self.logger.info("Carga múltiple completada: archivos=%s, filas_totales=%s", len(files), total_loaded)
         except Exception as e:
             self.logger.exception("Error en carga múltiple de Excel: %s", e)
+        finally:
+            try:
+                self._hide_loading()
+            except Exception:
+                pass

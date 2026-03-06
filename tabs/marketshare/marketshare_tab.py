@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QTabWidget
 
 from .marketshare_vehiculos_tab import MarketshareVehiculosTab
+from .marketshare_repuestos_tab import MarketshareRepuestosTab
 
 
 class MarketshareTab(QWidget):
@@ -15,4 +16,15 @@ class MarketshareTab(QWidget):
 		self.vehiculos_tab = MarketshareVehiculosTab()
 		self.tab_widget.addTab(self.vehiculos_tab, "Vehículos")
 
-		# Placeholder: agregar más pestañas aquí si se encuentran en el proyecto
+		# Nueva sub-pestaña para Repuestos
+		try:
+			self.repuestos_tab = MarketshareRepuestosTab()
+			self.tab_widget.addTab(self.repuestos_tab, "Marketshare_Repuestos")
+		except Exception:
+			# si falla la creación, no bloquear la carga
+			try:
+				# crear placeholder mínimo
+				ph = QWidget()
+				self.tab_widget.addTab(ph, "Marketshare_Repuestos")
+			except Exception:
+				pass
