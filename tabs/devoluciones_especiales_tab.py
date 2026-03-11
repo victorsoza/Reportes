@@ -24,7 +24,6 @@ class DevolucionesEspecialesTab(QWidget):
 
         self.current_df: Optional[pd.DataFrame] = None
         self.updating_table = False
-
         # UI setup
         layout = QVBoxLayout(self)
 
